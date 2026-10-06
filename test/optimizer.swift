@@ -72,6 +72,80 @@ final class OptimizerTests: XCTestCase {
     }
   }
 
+  func testGradScalerRejectsNonFiniteModelGradientsOnMPSStream() throws {
+    for gradient in [Float16.infinity, -Float16.infinity] {
+      let dynamicGraph = DynamicGraph()
+      do {
+        let input = dynamicGraph.variable(Tensor<Float16>([1, 1], .GPU(0), .C(2)))
+        let modelInput = Input()
+        let parameters = (0..<169).map { _ in Parameter<Float16>(.GPU(0), .C(2)) }
+        let model = Model([modelInput], parameters.map { modelInput + $0 })
+        let _ = model(inputs: input)
+        let before = (0..<parameters.count).map {
+          model.parameters[$0].copied(Float16.self).toCPU()
+        }
+        var optimizer = AdamOptimizer(dynamicGraph, rate: 0.1)
+        optimizer.parameters = [model.parameters]
+        var scaler = GradScaler(
+          scale: 8, growthFactor: 2, backoffFactor: 0.5, growthInterval: 2_000)
+
+        let nonFiniteCoefficient = dynamicGraph.constant(
+          Tensor<Float16>([1, gradient], .GPU(0), .C(2)))
+        let finiteCoefficient = dynamicGraph.constant(
+          Tensor<Float16>([1, 1], .GPU(0), .C(2)))
+        for _ in 0..<3 {
+          let finiteAccumulationOutputs = model(inputs: input).map {
+            DynamicGraph.Tensor<Float16>($0)
+          }
+          var finiteAccumulationLoss = finiteAccumulationOutputs[0] .* finiteCoefficient
+          for output in finiteAccumulationOutputs.dropFirst() {
+            finiteAccumulationLoss = finiteAccumulationLoss + output .* finiteCoefficient
+          }
+          finiteAccumulationLoss.backward(to: input)
+        }
+        let outputs = model(inputs: input).map { DynamicGraph.Tensor<Float16>($0) }
+        var loss = outputs[0] .* nonFiniteCoefficient
+        for output in outputs.dropFirst() {
+          loss = loss + output .* finiteCoefficient
+        }
+        loss.backward(to: input)
+        scaler.step(&optimizer)
+
+        let afterRejectedStep = (0..<parameters.count).map {
+          model.parameters[$0].copied(Float16.self).toCPU()
+        }
+        for parameterIndex in 0..<parameters.count {
+          for i in 0..<2 {
+            XCTAssertTrue(afterRejectedStep[parameterIndex][i].isFinite)
+            XCTAssertEqual(afterRejectedStep[parameterIndex][i], before[parameterIndex][i])
+          }
+        }
+        XCTAssertEqual(scaler.scale, 4)
+        XCTAssertEqual(optimizer.step, 1)
+
+        let finiteOutputs = model(inputs: input).map { DynamicGraph.Tensor<Float16>($0) }
+        var finiteLoss = finiteOutputs[0] .* finiteCoefficient
+        for output in finiteOutputs.dropFirst() {
+          finiteLoss = finiteLoss + output .* finiteCoefficient
+        }
+        finiteLoss.backward(to: input)
+        scaler.step(&optimizer)
+
+        let afterFiniteStep = (0..<parameters.count).map {
+          model.parameters[$0].copied(Float16.self).toCPU()
+        }
+        for parameterIndex in 0..<parameters.count {
+          for i in 0..<2 {
+            XCTAssertTrue(afterFiniteStep[parameterIndex][i].isFinite)
+            XCTAssertNotEqual(afterFiniteStep[parameterIndex][i], before[parameterIndex][i])
+          }
+        }
+        XCTAssertEqual(scaler.scale, 4)
+        XCTAssertEqual(optimizer.step, 2)
+      }
+    }
+  }
+
   func testGradScalerRejectsNonFiniteGradients() throws {
     let finite = runGradScalerStep(gradient: 8)
     XCTAssertEqual(finite.parameter, 0.9, accuracy: 1e-6)

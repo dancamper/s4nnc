@@ -22,7 +22,7 @@ let package = Package(
   ],
   dependencies: [
     .package(
-      url: "https://github.com/dancamper/ccv.git", revision: "1281847ede3943d8927a067b3953ac190d7e7c62"
+      url: "https://github.com/dancamper/ccv.git", revision: "da7be29b8ba5a076082ce21d09900dadc686fcd6"
     ),
     .package(
       url: "https://github.com/weiyanlin117/swift-fpzip-support.git",
