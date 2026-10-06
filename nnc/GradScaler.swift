@@ -36,7 +36,9 @@ public struct GradScaler {
     loss.grad = T(grad).scaled(by: scale, streamContext: streamContext).typeErased
     return loss
   }
-  private func isNaN<T: Optimizer>(_ optimizers: [T], streamContext: StreamContext? = nil) -> Bool {
+  private func hasNonFinite<T: Optimizer>(_ optimizers: [T], streamContext: StreamContext? = nil)
+    -> Bool
+  {
     precondition(optimizers.count > 0)
     let graph = optimizers[0].graph
     let _streamContext = (streamContext ?? graph.streamContext)?._stream
@@ -50,7 +52,8 @@ public struct GradScaler {
     for parameter in primaryModelParameters {
       let model = parameter.model!
       models.remove(HashableModel(model: model))
-      if ccv_cnnp_model_parameter_gradients_isnan(model.cModel, parameter._io, _streamContext) != 0
+      if ccv_cnnp_model_parameter_gradients_has_non_finite(
+        model.cModel, parameter._io, _streamContext) != 0
       {
         return true
       }
@@ -67,8 +70,8 @@ public struct GradScaler {
     }
     for (key, parameters) in modelParametersMap {
       for parameter in parameters {
-        if ccv_cnnp_model_parameter_gradients_isnan(key.model.cModel, parameter._io, _streamContext)
-          != 0
+        if ccv_cnnp_model_parameter_gradients_has_non_finite(
+          key.model.cModel, parameter._io, _streamContext) != 0
         {
           return true
         }
@@ -76,13 +79,13 @@ public struct GradScaler {
     }
     let tensorParameters = parameters.compactMap { $0 as? DynamicGraph.AnyTensor }
     for tensor in tensorParameters {
-      if tensor.grad?.isNaN ?? false {
+      if tensor.grad?.hasNonFinite ?? false {
         return true
       }
     }
     let groupParameters = parameters.compactMap { $0 as? DynamicGraph.Group }
     for tensor in groupParameters {
-      if tensor.grad?.isNaN ?? false {
+      if tensor.grad?.hasNonFinite ?? false {
         return true
       }
     }
@@ -144,15 +147,23 @@ public struct GradScaler {
   public mutating func step<T: Optimizer>(
     _ optimizers: inout [T], streamContext: StreamContext? = nil
   ) {
-    guard !isNaN(optimizers, streamContext: streamContext) else {
-      // Running optimizer step with noop. This way, we will clean up the apply gradients thing.
+    guard !hasNonFinite(optimizers, streamContext: streamContext) else {
+      // Apply noop to clear model gradients. Tensor gradients can be dropped directly.
       let params = CmdParamsFactory.factory.newParams()
       let noop = ccv_nnc_cmd(CCV_NNC_NOOP, nil, params, 0)
       for optimizer in optimizers {
         let addons = (optimizer as! OptimizerAddons)
-        optimizerStep(
-          graph: optimizer.graph, minimizer: noop, parameters: optimizer.parameters,
-          savedAux: addons.savedAux, streamContext: streamContext)
+        let modelParameters = optimizer.parameters.filter { $0 is Model.Parameters }
+        if !modelParameters.isEmpty {
+          optimizerStep(
+            graph: optimizer.graph, minimizer: noop, parameters: modelParameters,
+            savedAux: addons.savedAux, streamContext: streamContext)
+        }
+        for parameter in optimizer.parameters.compactMap({ $0 as? DynamicGraph_Any }) {
+          for tensor in parameter.untyped {
+            tensor.grad = nil
+          }
+        }
       }
       scale *= backoffFactor
       return

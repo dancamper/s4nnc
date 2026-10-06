@@ -163,6 +163,14 @@ extension DynamicGraph.Group: DynamicGraph.AnyGroup {
     }
     return false
   }
+  public var hasNonFinite: Bool {
+    for tensor in underlyingArray {
+      if tensor.hasNonFinite {
+        return true
+      }
+    }
+    return false
+  }
 }
 
 extension DynamicGraph.Group where Element: DynamicGraph.AnyTensor {
