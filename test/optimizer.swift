@@ -3,6 +3,87 @@ import XCTest
 
 final class OptimizerTests: XCTestCase {
 
+  private func runGradScalerStep(gradient: Float32, kind: DeviceKind = .CPU) -> (
+    parameter: Float32, scale: Float
+  ) {
+    let dynamicGraph = DynamicGraph()
+    let parameter: DynamicGraph.Tensor<Float32> = dynamicGraph.variable(kind, .NC(1, 2))
+    parameter.full(1)
+    let gradientTensor: DynamicGraph.Tensor<Float32> = dynamicGraph.variable(kind, .NC(1, 2))
+    gradientTensor.full(gradient)
+    var optimizer = SGDOptimizer(
+      dynamicGraph, nesterov: false, rate: 0.1, scale: 1, decay: 0, momentum: 0,
+      dampening: 0)
+    optimizer.parameters = [parameter]
+    let loss = parameter .* gradientTensor
+    loss.backward(to: parameter)
+    var scaler = GradScaler(scale: 8, growthFactor: 2, backoffFactor: 0.5, growthInterval: 2_000)
+    scaler.step(&optimizer)
+    return (parameter.toCPU().rawValue[0, 0], scaler.scale)
+  }
+
+  func testGradScalerRejectsNonFiniteGradientsOnMPS() throws {
+    for gradient in [Float32.nan, Float32.infinity, -Float32.infinity] {
+      let result = runGradScalerStep(gradient: gradient, kind: .GPU(0))
+      XCTAssertEqual(result.parameter, 1)
+      XCTAssertEqual(result.scale, 4)
+    }
+  }
+
+  func testGradScalerSkippedAdamStepDoesNotCorruptState() throws {
+    let dynamicGraph = DynamicGraph()
+    let parameter = dynamicGraph.variable(Tensor<Float32>([1], .CPU, .C(1)))
+    var optimizer = AdamOptimizer(dynamicGraph, rate: 0.1)
+    optimizer.parameters = [parameter]
+    var scaler = GradScaler(scale: 8, growthFactor: 2, backoffFactor: 0.5, growthInterval: 2_000)
+
+    var coefficient = dynamicGraph.constant(Tensor<Float32>([Float32.infinity], .CPU, .C(1)))
+    (parameter * coefficient).backward(to: parameter)
+    scaler.step(&optimizer)
+    XCTAssertEqual(parameter[0], 1)
+    XCTAssertEqual(optimizer.step, 1)
+
+    coefficient = dynamicGraph.constant(Tensor<Float32>([4], .CPU, .C(1)))
+    (parameter * coefficient).backward(to: parameter)
+    scaler.step(&optimizer)
+    XCTAssertTrue(parameter[0].isFinite)
+    XCTAssertNotEqual(parameter[0], 1)
+    XCTAssertEqual(optimizer.step, 2)
+  }
+
+  func testGradScalerRejectsNonFiniteModelGradients() throws {
+    for gradient in [Float32.nan, Float32.infinity, -Float32.infinity] {
+      let dynamicGraph = DynamicGraph()
+      let model = Dense(count: 1)
+      let input = dynamicGraph.variable(Tensor<Float32>([1], .CPU, .C(1)))
+      var optimizer = SGDOptimizer(
+        dynamicGraph, nesterov: false, rate: 0.1, scale: 1, decay: 0, momentum: 0,
+        dampening: 0)
+      optimizer.parameters = [model.parameters]
+      let output = model(input)
+      let before = output[0]
+      let coefficient = dynamicGraph.constant(Tensor<Float32>([gradient], .CPU, .C(1)))
+      (output * coefficient).backward(to: input)
+      var scaler = GradScaler(
+        scale: 8, growthFactor: 2, backoffFactor: 0.5, growthInterval: 2_000)
+      scaler.step(&optimizer)
+      XCTAssertEqual(model(input)[0], before)
+      XCTAssertEqual(scaler.scale, 4)
+    }
+  }
+
+  func testGradScalerRejectsNonFiniteGradients() throws {
+    let finite = runGradScalerStep(gradient: 8)
+    XCTAssertEqual(finite.parameter, 0.9, accuracy: 1e-6)
+    XCTAssertEqual(finite.scale, 8)
+
+    for gradient in [Float32.nan, Float32.infinity, -Float32.infinity] {
+      let result = runGradScalerStep(gradient: gradient)
+      XCTAssertEqual(result.parameter, 1)
+      XCTAssertEqual(result.scale, 4)
+    }
+  }
+
   func testSGDOnModel() throws {
     let dynamicGraph = DynamicGraph()
     let linear = Dense(count: 1)
@@ -104,6 +185,10 @@ final class OptimizerTests: XCTestCase {
   }
 
   static let allTests = [
+    ("testGradScalerRejectsNonFiniteGradients", testGradScalerRejectsNonFiniteGradients),
+    ("testGradScalerRejectsNonFiniteGradientsOnMPS", testGradScalerRejectsNonFiniteGradientsOnMPS),
+    ("testGradScalerSkippedAdamStepDoesNotCorruptState", testGradScalerSkippedAdamStepDoesNotCorruptState),
+    ("testGradScalerRejectsNonFiniteModelGradients", testGradScalerRejectsNonFiniteModelGradients),
     ("testSGDOnModel", testSGDOnModel),
     ("testSGDOnGraph", testSGDOnGraph),
     ("testCopyTrainedModel", testCopyTrainedModel),
